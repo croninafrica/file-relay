@@ -199,7 +199,9 @@ func (a *App) routes() http.Handler {
 
 func (a *App) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+		scriptDigest := sha256.Sum256([]byte(adminJS))
+		scriptHash := base64.StdEncoding.EncodeToString(scriptDigest[:])
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'sha256-"+scriptHash+"'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 		w.Header().Set("Referrer-Policy", "same-origin")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")

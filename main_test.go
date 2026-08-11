@@ -192,19 +192,33 @@ func TestSecurityHeadersPreserveSameOriginFormOrigin(t *testing.T) {
 	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, "connect-src 'self'") {
 		t.Fatalf("same-origin upload requests are not allowed by CSP: %q", got)
 	}
+	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, "'sha256-") {
+		t.Fatalf("inline admin script hash is not allowed by CSP: %q", got)
+	}
 }
 
 func TestAdminPageIncludesUploadProgressUI(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	render(recorder, adminTemplate, adminView{BasePath: "/transfer", CSRF: "csrf", MaxUpload: "5.0 GiB"})
 	html := recorder.Body.String()
-	for _, expected := range []string{"id=\"upload-form\"", "id=\"upload-progress\"", "id=\"upload-bar\"", "/transfer/assets/admin-v3.js"} {
+	for _, expected := range []string{"id=\"upload-form\"", "id=\"upload-progress\"", "id=\"upload-bar\"", "id=\"system-dialog\"", "<script>(function(){"} {
 		if !strings.Contains(html, expected) {
 			t.Fatalf("admin page missing %q", expected)
 		}
 	}
+	if strings.Contains(html, "/assets/admin.js") {
+		t.Fatal("admin script should be inline to avoid an extra page-load request")
+	}
 	if !strings.Contains(adminJS, "request.upload.addEventListener") || !strings.Contains(adminJS, "/chunk/") || !strings.Contains(adminJS, "retryChunk") {
 		t.Fatal("upload progress handler missing")
+	}
+	for _, forbidden := range []string{"beforeunload", "window.alert", "window.confirm"} {
+		if strings.Contains(adminJS, forbidden) {
+			t.Fatalf("browser-native dialog remains in admin script: %s", forbidden)
+		}
+	}
+	if !strings.Contains(adminJS, "openDialog(deleteForm") {
+		t.Fatal("in-page delete confirmation is missing")
 	}
 	completed := strings.Index(adminJS, "uploading=false;\n        submitButton.textContent=\"上传完成\"")
 	navigate := strings.Index(adminJS, "window.location.replace")
