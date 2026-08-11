@@ -182,4 +182,24 @@ func TestSecurityHeadersPreserveSameOriginFormOrigin(t *testing.T) {
 	if got := rec.Header().Get("Referrer-Policy"); got != "same-origin" {
 		t.Fatalf("unexpected Referrer-Policy %q", got)
 	}
+	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, "script-src 'self'") {
+		t.Fatalf("admin script is not allowed by CSP: %q", got)
+	}
+}
+
+func TestAdminPageIncludesUploadProgressUI(t *testing.T) {
+	var output strings.Builder
+	err := adminTemplate.Execute(&output, adminView{BasePath: "/transfer", CSRF: "csrf", MaxUpload: "5.0 GiB"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := output.String()
+	for _, expected := range []string{"id=\"upload-form\"", "id=\"upload-progress\"", "id=\"upload-bar\"", "/transfer/assets/admin.js"} {
+		if !strings.Contains(html, expected) {
+			t.Fatalf("admin page missing %q", expected)
+		}
+	}
+	if !strings.Contains(adminJS, "request.upload.addEventListener") {
+		t.Fatal("upload progress handler missing")
+	}
 }

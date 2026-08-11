@@ -164,6 +164,7 @@ func main() {
 func (a *App) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealth)
+	mux.HandleFunc("GET /assets/admin.js", a.handleAdminJS)
 	mux.HandleFunc("GET /", a.handleRoot)
 	mux.HandleFunc("GET /admin/login", a.handleLoginPage)
 	mux.HandleFunc("POST /admin/login", a.handleLogin)
@@ -180,7 +181,7 @@ func (a *App) routes() http.Handler {
 
 func (a *App) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 		w.Header().Set("Referrer-Policy", "same-origin")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
@@ -221,6 +222,12 @@ func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, "ok\n")
+}
+
+func (a *App) handleAdminJS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	_, _ = io.WriteString(w, adminJS)
 }
 
 func (a *App) handleRoot(w http.ResponseWriter, r *http.Request) {
@@ -324,7 +331,13 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			URL: a.cfg.PublicBaseURL + "/s/" + share.ID, Protected: share.PasswordHash != "", Downloads: downloads, Expired: !share.ExpiresAt.After(now),
 		})
 	}
-	render(w, adminTemplate, adminView{BasePath: a.cfg.BasePath, CSRF: session.CSRF, Shares: items, MaxUpload: humanBytes(a.cfg.MaxUploadBytes)})
+	notice := ""
+	if r.URL.Query().Get("uploaded") == "1" {
+		notice = "上传完成，分享链接已创建。"
+	} else if r.URL.Query().Get("deleted") == "1" {
+		notice = "分享及文件已删除。"
+	}
+	render(w, adminTemplate, adminView{BasePath: a.cfg.BasePath, CSRF: session.CSRF, Shares: items, MaxUpload: humanBytes(a.cfg.MaxUploadBytes), Notice: notice})
 }
 
 func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -443,7 +456,7 @@ func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "metadata error", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, a.cfg.BasePath+"/admin", http.StatusSeeOther)
+	http.Redirect(w, r, a.cfg.BasePath+"/admin?uploaded=1", http.StatusSeeOther)
 }
 
 func (a *App) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -461,7 +474,7 @@ func (a *App) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = os.Remove(filepath.Join(a.cfg.DataDir, share.StoredName))
-	http.Redirect(w, r, a.cfg.BasePath+"/admin", http.StatusSeeOther)
+	http.Redirect(w, r, a.cfg.BasePath+"/admin?deleted=1", http.StatusSeeOther)
 }
 
 func (a *App) handleShare(w http.ResponseWriter, r *http.Request) {
