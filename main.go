@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -108,6 +109,18 @@ type App struct {
 	store        *Store
 	loginMu      sync.Mutex
 	loginLimiter *loginLimiter
+	uploadMu     sync.Mutex
+}
+
+const uploadChunkSize int64 = 8 * 1024 * 1024
+
+type pendingUpload struct {
+	ID           string    `json:"id"`
+	OriginalName string    `json:"original_name"`
+	Size         int64     `json:"size"`
+	PasswordHash string    `json:"password_hash,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 func main() {
@@ -165,12 +178,16 @@ func (a *App) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealth)
 	mux.HandleFunc("GET /assets/admin.js", a.handleAdminJS)
+	mux.HandleFunc("GET /assets/admin-v2.js", a.handleAdminJS)
 	mux.HandleFunc("GET /", a.handleRoot)
 	mux.HandleFunc("GET /admin/login", a.handleLoginPage)
 	mux.HandleFunc("POST /admin/login", a.handleLogin)
 	mux.HandleFunc("POST /admin/logout", a.handleLogout)
 	mux.HandleFunc("GET /admin", a.handleAdmin)
 	mux.HandleFunc("POST /admin/upload", a.handleUpload)
+	mux.HandleFunc("POST /admin/upload/init", a.handleUploadInit)
+	mux.HandleFunc("POST /admin/upload/chunk/{id}", a.handleUploadChunk)
+	mux.HandleFunc("POST /admin/upload/finish/{id}", a.handleUploadFinish)
 	mux.HandleFunc("POST /admin/delete", a.handleDelete)
 	mux.HandleFunc("GET /s/{id}", a.handleShare)
 	mux.HandleFunc("POST /s/{id}/authorize", a.handleAuthorize)
@@ -459,6 +476,237 @@ func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, a.cfg.BasePath+"/admin?uploaded=1", http.StatusSeeOther)
 }
 
+func (a *App) handleUploadInit(w http.ResponseWriter, r *http.Request) {
+	session, ok := a.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	if err := r.ParseForm(); err != nil || r.FormValue("csrf") != session.CSRF {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	name := safeFilename(r.FormValue("name"))
+	size, err := strconv.ParseInt(r.FormValue("size"), 10, 64)
+	if err != nil || size <= 0 || size > a.cfg.MaxUploadBytes || name == "" {
+		http.Error(w, "invalid upload", http.StatusBadRequest)
+		return
+	}
+	passwordHash := ""
+	if password := r.FormValue("password"); password != "" {
+		passwordHash, err = hashPassword(password)
+		if err != nil {
+			http.Error(w, "password must be at least 12 characters", http.StatusBadRequest)
+			return
+		}
+	}
+	expires := a.cfg.DefaultExpiry
+	if hours, parseErr := strconv.Atoi(strings.TrimSpace(r.FormValue("expires_hours"))); parseErr == nil && hours > 0 {
+		expires = time.Duration(hours) * time.Hour
+	}
+	if expires > a.cfg.MaxExpiry {
+		expires = a.cfg.MaxExpiry
+	}
+	id, err := randomToken(24)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	pending := pendingUpload{ID: id, OriginalName: name, Size: size, PasswordHash: passwordHash, CreatedAt: time.Now().UTC()}
+	pending.ExpiresAt = pending.CreatedAt.Add(expires)
+	partPath, metaPath, ok := a.pendingUploadPaths(id)
+	if !ok {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	file, err := os.OpenFile(partPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		_ = os.Remove(partPath)
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	raw, err := json.Marshal(pending)
+	if err != nil || os.WriteFile(metaPath, raw, 0600) != nil {
+		_ = os.Remove(partPath)
+		_ = os.Remove(metaPath)
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "offset": int64(0), "chunk_size": uploadChunkSize})
+}
+
+func (a *App) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
+	session, ok := a.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	if r.Header.Get("X-CSRF-Token") != session.CSRF {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	offset, err := strconv.ParseInt(r.Header.Get("X-Upload-Offset"), 10, 64)
+	if err != nil || offset < 0 {
+		http.Error(w, "invalid offset", http.StatusBadRequest)
+		return
+	}
+	id := r.PathValue("id")
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	pending, partPath, _, err := a.loadPendingUpload(id)
+	if err != nil {
+		http.Error(w, "upload not found", http.StatusNotFound)
+		return
+	}
+	info, err := os.Stat(partPath)
+	if err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	actual := info.Size()
+	if offset != actual {
+		writeJSON(w, http.StatusConflict, map[string]any{"offset": actual})
+		return
+	}
+	remaining := pending.Size - actual
+	if remaining <= 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"offset": actual})
+		return
+	}
+	limit := uploadChunkSize
+	if remaining < limit {
+		limit = remaining
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit+1)
+	file, err := os.OpenFile(partPath, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	written, copyErr := io.Copy(file, io.LimitReader(r.Body, limit+1))
+	if copyErr != nil || written <= 0 || written > limit {
+		_ = file.Close()
+		_ = os.Truncate(partPath, actual)
+		http.Error(w, "invalid chunk", http.StatusBadRequest)
+		return
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Truncate(partPath, actual)
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Truncate(partPath, actual)
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"offset": actual + written})
+}
+
+func (a *App) handleUploadFinish(w http.ResponseWriter, r *http.Request) {
+	session, ok := a.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
+	if err := r.ParseForm(); err != nil || r.FormValue("csrf") != session.CSRF {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	id := r.PathValue("id")
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	pending, partPath, metaPath, err := a.loadPendingUpload(id)
+	if err != nil {
+		http.Error(w, "upload not found", http.StatusNotFound)
+		return
+	}
+	file, err := os.Open(partPath)
+	if err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	info, err := file.Stat()
+	if err != nil || info.Size() != pending.Size {
+		_ = file.Close()
+		http.Error(w, "upload incomplete", http.StatusConflict)
+		return
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		_ = file.Close()
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	if err := file.Close(); err != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	shareID, err := randomToken(24)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	storedName := shareID + ".blob"
+	finalPath := filepath.Join(a.cfg.DataDir, storedName)
+	if err := os.Chmod(partPath, 0640); err != nil || os.Rename(partPath, finalPath) != nil {
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	share := &Share{ID: shareID, OriginalName: pending.OriginalName, StoredName: storedName, Size: pending.Size, SHA256: hex.EncodeToString(hasher.Sum(nil)), CreatedAt: pending.CreatedAt, ExpiresAt: pending.ExpiresAt, PasswordHash: pending.PasswordHash}
+	if err := a.store.create(share); err != nil {
+		_ = os.Rename(finalPath, partPath)
+		http.Error(w, "metadata error", http.StatusInternalServerError)
+		return
+	}
+	if err := os.Remove(metaPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("remove completed upload metadata %s: %v", id, err)
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"success_url": a.cfg.BasePath + "/admin?uploaded=1"})
+}
+
+func (a *App) pendingUploadPaths(id string) (string, string, bool) {
+	if len(id) != 32 {
+		return "", "", false
+	}
+	for _, char := range id {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '-' && char != '_' {
+			return "", "", false
+		}
+	}
+	base := filepath.Join(a.cfg.DataDir, ".upload-"+id)
+	return base + ".part", base + ".json", true
+}
+
+func (a *App) loadPendingUpload(id string) (pendingUpload, string, string, error) {
+	partPath, metaPath, ok := a.pendingUploadPaths(id)
+	if !ok {
+		return pendingUpload{}, "", "", errors.New("invalid upload id")
+	}
+	raw, err := os.ReadFile(metaPath)
+	if err != nil {
+		return pendingUpload{}, "", "", err
+	}
+	var pending pendingUpload
+	if err := json.Unmarshal(raw, &pending); err != nil || pending.ID != id || pending.Size <= 0 || pending.Size > a.cfg.MaxUploadBytes {
+		return pendingUpload{}, "", "", errors.New("invalid upload metadata")
+	}
+	return pending, partPath, metaPath, nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
 func (a *App) handleDelete(w http.ResponseWriter, r *http.Request) {
 	session, ok := a.requireAdmin(w, r)
 	if !ok {
@@ -583,6 +831,28 @@ func (a *App) cleanupExpired() {
 	for _, share := range removed {
 		if err := os.Remove(filepath.Join(a.cfg.DataDir, share.StoredName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			log.Printf("cleanup %s: %v", share.ID, err)
+		}
+	}
+	a.cleanupAbandonedUploads(time.Now().Add(-24 * time.Hour))
+}
+
+func (a *App) cleanupAbandonedUploads(olderThan time.Time) {
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+	metadataFiles, err := filepath.Glob(filepath.Join(a.cfg.DataDir, ".upload-*.json"))
+	if err != nil {
+		log.Printf("scan abandoned uploads: %v", err)
+		return
+	}
+	for _, metaPath := range metadataFiles {
+		info, statErr := os.Stat(metaPath)
+		if statErr != nil || !info.ModTime().Before(olderThan) {
+			continue
+		}
+		base := strings.TrimSuffix(metaPath, ".json")
+		_ = os.Remove(base + ".part")
+		if err := os.Remove(metaPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("cleanup abandoned upload %s: %v", filepath.Base(base), err)
 		}
 	}
 }

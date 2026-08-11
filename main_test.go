@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -188,18 +192,94 @@ func TestSecurityHeadersPreserveSameOriginFormOrigin(t *testing.T) {
 }
 
 func TestAdminPageIncludesUploadProgressUI(t *testing.T) {
-	var output strings.Builder
-	err := adminTemplate.Execute(&output, adminView{BasePath: "/transfer", CSRF: "csrf", MaxUpload: "5.0 GiB"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	html := output.String()
-	for _, expected := range []string{"id=\"upload-form\"", "id=\"upload-progress\"", "id=\"upload-bar\"", "/transfer/assets/admin.js"} {
+	recorder := httptest.NewRecorder()
+	render(recorder, adminTemplate, adminView{BasePath: "/transfer", CSRF: "csrf", MaxUpload: "5.0 GiB"})
+	html := recorder.Body.String()
+	for _, expected := range []string{"id=\"upload-form\"", "id=\"upload-progress\"", "id=\"upload-bar\"", "/transfer/assets/admin-v2.js"} {
 		if !strings.Contains(html, expected) {
 			t.Fatalf("admin page missing %q", expected)
 		}
 	}
-	if !strings.Contains(adminJS, "request.upload.addEventListener") {
+	if !strings.Contains(adminJS, "request.upload.addEventListener") || !strings.Contains(adminJS, "/chunk/") || !strings.Contains(adminJS, "retryChunk") {
 		t.Fatal("upload progress handler missing")
+	}
+}
+
+func TestChunkedUploadCreatesShare(t *testing.T) {
+	dir := t.TempDir()
+	store, err := openStore(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := []byte("01234567890123456789012345678901")
+	app := &App{cfg: Config{
+		DataDir: dir, BasePath: "/transfer", PublicBaseURL: "https://example.test/transfer",
+		SigningKey: key, MaxUploadBytes: 1024 * 1024, DefaultExpiry: time.Hour, MaxExpiry: 24 * time.Hour,
+	}, store: store, loginLimiter: newLoginLimiter()}
+	handler := app.routes()
+	csrf := "test-csrf"
+	token, err := signToken(key, signedToken{Kind: "admin", CSRF: csrf, Expires: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminCookie := &http.Cookie{Name: "relay_admin", Value: token, Path: "/transfer/"}
+	payload := []byte("chunked upload content")
+
+	initForm := url.Values{"csrf": {csrf}, "name": {"report.txt"}, "size": {strconv.Itoa(len(payload))}, "expires_hours": {"2"}}
+	initReq := httptest.NewRequest(http.MethodPost, "https://example.test/admin/upload/init", strings.NewReader(initForm.Encode()))
+	initReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	initReq.Header.Set("Origin", "https://example.test")
+	initReq.AddCookie(adminCookie)
+	initRec := httptest.NewRecorder()
+	handler.ServeHTTP(initRec, initReq)
+	if initRec.Code != http.StatusCreated {
+		t.Fatalf("init status %d: %s", initRec.Code, initRec.Body.String())
+	}
+	var initialized struct {
+		ID     string `json:"id"`
+		Offset int64  `json:"offset"`
+	}
+	if err := json.Unmarshal(initRec.Body.Bytes(), &initialized); err != nil || initialized.ID == "" {
+		t.Fatalf("invalid init response: %v, %s", err, initRec.Body.String())
+	}
+
+	chunkReq := httptest.NewRequest(http.MethodPost, "https://example.test/admin/upload/chunk/"+initialized.ID, bytes.NewReader(payload))
+	chunkReq.Header.Set("Origin", "https://example.test")
+	chunkReq.Header.Set("X-CSRF-Token", csrf)
+	chunkReq.Header.Set("X-Upload-Offset", "0")
+	chunkReq.AddCookie(adminCookie)
+	chunkRec := httptest.NewRecorder()
+	handler.ServeHTTP(chunkRec, chunkReq)
+	if chunkRec.Code != http.StatusOK {
+		t.Fatalf("chunk status %d: %s", chunkRec.Code, chunkRec.Body.String())
+	}
+	replayReq := httptest.NewRequest(http.MethodPost, "https://example.test/admin/upload/chunk/"+initialized.ID, bytes.NewReader(payload))
+	replayReq.Header.Set("Origin", "https://example.test")
+	replayReq.Header.Set("X-CSRF-Token", csrf)
+	replayReq.Header.Set("X-Upload-Offset", "0")
+	replayReq.AddCookie(adminCookie)
+	replayRec := httptest.NewRecorder()
+	handler.ServeHTTP(replayRec, replayReq)
+	if replayRec.Code != http.StatusConflict || !strings.Contains(replayRec.Body.String(), strconv.Itoa(len(payload))) {
+		t.Fatalf("replayed chunk did not report current offset: %d %s", replayRec.Code, replayRec.Body.String())
+	}
+
+	finishForm := url.Values{"csrf": {csrf}}
+	finishReq := httptest.NewRequest(http.MethodPost, "https://example.test/admin/upload/finish/"+initialized.ID, strings.NewReader(finishForm.Encode()))
+	finishReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	finishReq.Header.Set("Origin", "https://example.test")
+	finishReq.AddCookie(adminCookie)
+	finishRec := httptest.NewRecorder()
+	handler.ServeHTTP(finishRec, finishReq)
+	if finishRec.Code != http.StatusCreated {
+		t.Fatalf("finish status %d: %s", finishRec.Code, finishRec.Body.String())
+	}
+	shares := store.list()
+	if len(shares) != 1 || shares[0].OriginalName != "report.txt" || shares[0].Size != int64(len(payload)) {
+		t.Fatalf("unexpected shares: %+v", shares)
+	}
+	stored, err := os.ReadFile(filepath.Join(dir, shares[0].StoredName))
+	if err != nil || !bytes.Equal(stored, payload) {
+		t.Fatalf("stored file mismatch: %v", err)
 	}
 }

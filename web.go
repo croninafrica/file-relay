@@ -3,6 +3,7 @@ package main
 import (
 	"html/template"
 	"net/http"
+	"strings"
 )
 
 const pageStyle = `
@@ -21,23 +22,42 @@ var progressStatus=document.getElementById("upload-status");
 var errorBox=document.getElementById("upload-error");
 var submitButton=document.getElementById("upload-button");
 var uploading=false;
+var maxRetries=3;
 function formatBytes(value){
   if(value<1024){return value+" B";}
   var units=["KiB","MiB","GiB","TiB"],size=value,index=-1;
   do{size/=1024;index++;}while(size>=1024&&index<units.length-1);
   return size.toFixed(size>=100?0:size>=10?1:2)+" "+units[index];
 }
+function parseJSON(request){
+  try{return JSON.parse(request.responseText);}catch(ignore){return {};}
+}
+function setProgress(loaded,total,started,message){
+  var percent=Math.min(100,Math.round(loaded/total*100));
+  var elapsed=Math.max((Date.now()-started)/1000,0.1);
+  progressBar.value=percent;
+  progressPercent.textContent=percent+"%";
+  progressStatus.textContent=message||formatBytes(loaded)+" / "+formatBytes(total)+" · "+formatBytes(loaded/elapsed)+"/s";
+}
 function showError(message){
   errorBox.textContent=message;
   errorBox.hidden=false;
-  progressWrap.hidden=true;
+  progressStatus.textContent="上传未完成，可以直接重试";
   submitButton.disabled=false;
-  submitButton.textContent="上传并创建链接";
+  submitButton.textContent="重试上传";
   uploading=false;
+}
+function postForm(url,data,done){
+  var request=new XMLHttpRequest();
+  request.open("POST",url,true);
+  request.setRequestHeader("Content-Type","application/x-www-form-urlencoded;charset=UTF-8");
+  request.addEventListener("load",function(){done(null,request);});
+  request.addEventListener("error",function(){done(new Error("network"),request);});
+  request.send(data.toString());
 }
 fileInput.addEventListener("change",function(){
   var file=fileInput.files&&fileInput.files[0];
-  fileMeta.textContent=file?file.name+" · "+formatBytes(file.size):"尚未选择文件";
+  fileMeta.textContent=file?file.name+" · "+formatBytes(file.size)+" · 分片上传，断线自动重试":"尚未选择文件";
 });
 form.addEventListener("submit",function(event){
   var file=fileInput.files&&fileInput.files[0];
@@ -48,27 +68,73 @@ form.addEventListener("submit",function(event){
   progressWrap.hidden=false;
   progressBar.value=0;
   progressPercent.textContent="0%";
-  progressStatus.textContent="准备上传…";
+  progressStatus.textContent="正在建立安全上传…";
   submitButton.disabled=true;
   submitButton.textContent="正在上传";
   var started=Date.now();
-  var request=new XMLHttpRequest();
-  request.open("POST",form.action,true);
-  request.upload.addEventListener("progress",function(progress){
-    if(!progress.lengthComputable){progressStatus.textContent="正在上传…";return;}
-    var percent=Math.min(100,Math.round(progress.loaded/progress.total*100));
-    var elapsed=Math.max((Date.now()-started)/1000,0.1);
-    progressBar.value=percent;
-    progressPercent.textContent=percent+"%";
-    progressStatus.textContent=percent===100?"上传完成，正在创建分享…":formatBytes(progress.loaded)+" / "+formatBytes(progress.total)+" · "+formatBytes(progress.loaded/elapsed)+"/s";
+  var csrf=form.elements.csrf.value;
+  var initData=new URLSearchParams();
+  initData.set("csrf",csrf);
+  initData.set("name",file.name);
+  initData.set("size",String(file.size));
+  initData.set("password",form.elements.password.value);
+  initData.set("expires_hours",form.elements.expires_hours.value);
+  postForm(form.action+"/init",initData,function(initError,initRequest){
+    if(initError){showError("网络连接失败，未开始上传，请重试。");return;}
+    if(initRequest.status<200||initRequest.status>=300){showError("无法开始上传（HTTP "+initRequest.status+"）。");return;}
+    var init=parseJSON(initRequest);
+    if(!init.id||!init.chunk_size){showError("服务器返回了无效的上传信息。");return;}
+    uploadChunk(init.id,Number(init.offset)||0,Number(init.chunk_size),0);
   });
-  request.addEventListener("load",function(){
-    if(request.status>=200&&request.status<400){window.location.assign(form.dataset.successUrl);return;}
-    showError("上传失败（HTTP "+request.status+"），请检查文件大小后重试。");
-  });
-  request.addEventListener("error",function(){showError("网络中断，上传未完成，请重试。");});
-  request.addEventListener("abort",function(){showError("上传已取消。");});
-  request.send(new FormData(form));
+  function uploadChunk(uploadID,offset,chunkSize,retry){
+    if(offset>=file.size){finishUpload(uploadID);return;}
+    var end=Math.min(offset+chunkSize,file.size);
+    var request=new XMLHttpRequest();
+    request.open("POST",form.action+"/chunk/"+encodeURIComponent(uploadID),true);
+    request.setRequestHeader("Content-Type","application/octet-stream");
+    request.setRequestHeader("X-CSRF-Token",csrf);
+    request.setRequestHeader("X-Upload-Offset",String(offset));
+    request.upload.addEventListener("progress",function(progress){
+      if(progress.lengthComputable){setProgress(offset+progress.loaded,file.size,started);}
+    });
+    request.addEventListener("load",function(){
+      var result=parseJSON(request);
+      if(request.status>=200&&request.status<300&&Number(result.offset)>offset){
+        uploadChunk(uploadID,Number(result.offset),chunkSize,0);
+        return;
+      }
+      if(request.status===409&&Number(result.offset)>=offset){
+        uploadChunk(uploadID,Number(result.offset),chunkSize,0);
+        return;
+      }
+      if((request.status===429||request.status>=500)&&retry<maxRetries){retryChunk(uploadID,offset,chunkSize,retry);return;}
+      showError("分片上传失败（HTTP "+request.status+"），请重试。");
+    });
+    request.addEventListener("error",function(){
+      if(retry<maxRetries){retryChunk(uploadID,offset,chunkSize,retry);return;}
+      showError("网络多次中断，上传停在 "+progressPercent.textContent+"，请重试。");
+    });
+    request.send(file.slice(offset,end));
+  }
+  function retryChunk(uploadID,offset,chunkSize,retry){
+    var nextRetry=retry+1;
+    progressStatus.textContent="网络中断，正在自动重试（"+nextRetry+"/"+maxRetries+"）…";
+    window.setTimeout(function(){uploadChunk(uploadID,offset,chunkSize,nextRetry);},Math.pow(2,retry)*1000);
+  }
+  function finishUpload(uploadID){
+    setProgress(file.size,file.size,started,"文件已上传，正在校验并创建分享链接…");
+    var finishData=new URLSearchParams();
+    finishData.set("csrf",csrf);
+    postForm(form.action+"/finish/"+encodeURIComponent(uploadID),finishData,function(error,request){
+      if(error){showError("文件已传完，但创建分享链接失败，请重试。");return;}
+      if(request.status>=200&&request.status<300){
+        progressStatus.textContent="上传成功，分享链接已创建";
+        window.location.assign(parseJSON(request).success_url||form.dataset.successUrl);
+        return;
+      }
+      showError("创建分享链接失败（HTTP "+request.status+"）。");
+    });
+  }
 });
 window.addEventListener("beforeunload",function(event){
   if(!uploading){return;}
@@ -109,8 +175,17 @@ func render(w http.ResponseWriter, tmpl *template.Template, data any) {
 }
 
 func renderStatus(w http.ResponseWriter, tmpl *template.Template, data any, status int) {
+	var output strings.Builder
+	if err := tmpl.Execute(&output, data); err != nil {
+		http.Error(w, "template error", http.StatusInternalServerError)
+		return
+	}
+	body := output.String()
+	if tmpl.Name() == "admin" {
+		body = strings.Replace(body, "/assets/admin.js", "/assets/admin-v2.js", 1)
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(status)
-	_ = tmpl.Execute(w, data)
+	_, _ = w.Write([]byte(body))
 }

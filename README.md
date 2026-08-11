@@ -11,6 +11,7 @@ A small, secure file transfer relay. Go handles authentication and metadata; Ngi
 - A client IP may create up to three download sessions per share. Range requests and resumptions reuse a 30-minute signed download ticket.
 - Client IP addresses are stored only as keyed HMAC values.
 - Uploaded filenames never become filesystem paths. Files are forced to download and are never interpreted by the application.
+- Browser uploads use sequential 8 MiB chunks with offset validation and automatic retry, keeping memory use low and avoiding oversized proxy requests.
 - Secrets and uploaded data live outside the Git repository.
 
 ## Production layout
