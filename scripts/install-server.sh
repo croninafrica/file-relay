@@ -90,11 +90,12 @@ install -m 0644 "${repo_dir}/deploy/file-relay-deploy.timer" /etc/systemd/system
 install -m 0755 "${repo_dir}/scripts/deploy-pull.sh" /usr/local/sbin/file-relay-deploy
 
 install -d -m 0755 /etc/nginx/snippets
+install -d -m 0700 /etc/nginx/backups
 install -m 0644 "${repo_dir}/deploy/nginx-location.conf" /etc/nginx/snippets/file-relay-location.conf
 install -m 0644 "${repo_dir}/deploy/cloudflare-real-ip.conf" /etc/nginx/conf.d/cloudflare-real-ip.conf
 
 if ! grep -q 'file-relay-location.conf' "${site_file}"; then
-    backup_file="${site_file}.before-file-relay.$(date +%Y%m%d%H%M%S)"
+    backup_file="/etc/nginx/backups/ledger.lay00.com.before-file-relay.$(date +%Y%m%d%H%M%S)"
     cp -a "${site_file}" "${backup_file}"
     sed -i '/^[[:space:]]*location \/ {/i\    include /etc/nginx/snippets/file-relay-location.conf;\n' "${site_file}"
     if ! nginx -t; then
