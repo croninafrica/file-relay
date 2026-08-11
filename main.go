@@ -179,6 +179,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /healthz", a.handleHealth)
 	mux.HandleFunc("GET /assets/admin.js", a.handleAdminJS)
 	mux.HandleFunc("GET /assets/admin-v2.js", a.handleAdminJS)
+	mux.HandleFunc("GET /assets/admin-v3.js", a.handleAdminJS)
 	mux.HandleFunc("GET /", a.handleRoot)
 	mux.HandleFunc("GET /admin/login", a.handleLoginPage)
 	mux.HandleFunc("POST /admin/login", a.handleLogin)

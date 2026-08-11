@@ -129,7 +129,9 @@ form.addEventListener("submit",function(event){
       if(error){showError("文件已传完，但创建分享链接失败，请重试。");return;}
       if(request.status>=200&&request.status<300){
         progressStatus.textContent="上传成功，分享链接已创建";
-        window.location.assign(parseJSON(request).success_url||form.dataset.successUrl);
+        uploading=false;
+        submitButton.textContent="上传完成";
+        window.location.replace(parseJSON(request).success_url||form.dataset.successUrl);
         return;
       }
       showError("创建分享链接失败（HTTP "+request.status+"）。");
@@ -182,7 +184,7 @@ func renderStatus(w http.ResponseWriter, tmpl *template.Template, data any, stat
 	}
 	body := output.String()
 	if tmpl.Name() == "admin" {
-		body = strings.Replace(body, "/assets/admin.js", "/assets/admin-v2.js", 1)
+		body = strings.Replace(body, "/assets/admin.js", "/assets/admin-v3.js", 1)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, no-store")

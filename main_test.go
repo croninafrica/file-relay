@@ -198,13 +198,18 @@ func TestAdminPageIncludesUploadProgressUI(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	render(recorder, adminTemplate, adminView{BasePath: "/transfer", CSRF: "csrf", MaxUpload: "5.0 GiB"})
 	html := recorder.Body.String()
-	for _, expected := range []string{"id=\"upload-form\"", "id=\"upload-progress\"", "id=\"upload-bar\"", "/transfer/assets/admin-v2.js"} {
+	for _, expected := range []string{"id=\"upload-form\"", "id=\"upload-progress\"", "id=\"upload-bar\"", "/transfer/assets/admin-v3.js"} {
 		if !strings.Contains(html, expected) {
 			t.Fatalf("admin page missing %q", expected)
 		}
 	}
 	if !strings.Contains(adminJS, "request.upload.addEventListener") || !strings.Contains(adminJS, "/chunk/") || !strings.Contains(adminJS, "retryChunk") {
 		t.Fatal("upload progress handler missing")
+	}
+	completed := strings.Index(adminJS, "uploading=false;\n        submitButton.textContent=\"上传完成\"")
+	navigate := strings.Index(adminJS, "window.location.replace")
+	if completed < 0 || navigate < 0 || completed > navigate {
+		t.Fatal("upload completion must disable the navigation guard before redirecting")
 	}
 }
 
