@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -184,7 +185,8 @@ func (a *App) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		if r.Method == http.MethodPost && !sameOrigin(r) {
+		if r.Method == http.MethodPost && !a.sameOrigin(r) {
+			log.Printf("blocked cross-origin request: origin=%q host=%q forwarded_proto=%q path=%q", r.Header.Get("Origin"), r.Host, r.Header.Get("X-Forwarded-Proto"), r.URL.Path)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -192,13 +194,24 @@ func (a *App) securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func sameOrigin(r *http.Request) bool {
+func (a *App) sameOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return true
 	}
 	u, err := url.Parse(origin)
-	return err == nil && strings.EqualFold(u.Host, r.Host)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return false
+	}
+	publicURL, publicErr := url.Parse(a.cfg.PublicBaseURL)
+	if publicErr == nil && strings.EqualFold(u.Scheme, publicURL.Scheme) && strings.EqualFold(u.Hostname(), publicURL.Hostname()) {
+		return true
+	}
+	requestHost := r.Host
+	if host, _, splitErr := net.SplitHostPort(r.Host); splitErr == nil {
+		requestHost = host
+	}
+	return strings.EqualFold(u.Hostname(), strings.Trim(requestHost, "[]"))
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {

@@ -147,3 +147,17 @@ func TestSafeFilename(t *testing.T) {
 		t.Fatalf("control characters were not removed: %q", got)
 	}
 }
+
+func TestSameOriginBehindReverseProxy(t *testing.T) {
+	app := &App{cfg: Config{PublicBaseURL: "https://ledger.lay00.com/transfer"}}
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/login", nil)
+	req.Host = "127.0.0.1:8081"
+	req.Header.Set("Origin", "https://ledger.lay00.com:443")
+	if !app.sameOrigin(req) {
+		t.Fatal("configured public origin was rejected behind reverse proxy")
+	}
+	req.Header.Set("Origin", "https://evil.example")
+	if app.sameOrigin(req) {
+		t.Fatal("cross-origin request was accepted")
+	}
+}
