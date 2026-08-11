@@ -189,6 +189,9 @@ func TestSecurityHeadersPreserveSameOriginFormOrigin(t *testing.T) {
 	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, "script-src 'self'") {
 		t.Fatalf("admin script is not allowed by CSP: %q", got)
 	}
+	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, "connect-src 'self'") {
+		t.Fatalf("same-origin upload requests are not allowed by CSP: %q", got)
+	}
 }
 
 func TestAdminPageIncludesUploadProgressUI(t *testing.T) {
