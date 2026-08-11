@@ -51,7 +51,17 @@ if [[ -f "${binary_path}" ]]; then
 fi
 mv -f "${binary_path}.new" "${binary_path}"
 
-if ! systemctl restart file-relay.service || ! curl --fail --silent --max-time 5 http://127.0.0.1:8081/healthz >/dev/null; then
+deployment_healthy=false
+if systemctl restart file-relay.service; then
+    for _ in $(seq 1 20); do
+        if curl --fail --silent --max-time 2 http://127.0.0.1:8081/healthz >/dev/null; then
+            deployment_healthy=true
+            break
+        fi
+        sleep 0.25
+    done
+fi
+if [[ "${deployment_healthy}" != true ]]; then
     if [[ -f "${binary_path}.previous" ]]; then
         mv -f "${binary_path}.previous" "${binary_path}"
         systemctl restart file-relay.service
