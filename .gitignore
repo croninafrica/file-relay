@@ -1,0 +1,7 @@
+file-relay
+file-relay.exe
+*.tmp
+*.log
+.env
+dist/
+.tools/
