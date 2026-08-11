@@ -181,12 +181,12 @@ func (a *App) routes() http.Handler {
 func (a *App) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
-		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Referrer-Policy", "same-origin")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		if r.Method == http.MethodPost && !a.sameOrigin(r) {
-			log.Printf("blocked cross-origin request: origin=%q host=%q forwarded_proto=%q path=%q", r.Header.Get("Origin"), r.Host, r.Header.Get("X-Forwarded-Proto"), r.URL.Path)
+			log.Printf("blocked cross-origin request: origin=%q host=%q forwarded_proto=%q fetch_site=%q fetch_mode=%q path=%q", r.Header.Get("Origin"), r.Host, r.Header.Get("X-Forwarded-Proto"), r.Header.Get("Sec-Fetch-Site"), r.Header.Get("Sec-Fetch-Mode"), r.URL.Path)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -198,6 +198,9 @@ func (a *App) sameOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return true
+	}
+	if origin == "null" {
+		return r.Header.Get("Sec-Fetch-Site") == "same-origin"
 	}
 	u, err := url.Parse(origin)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {

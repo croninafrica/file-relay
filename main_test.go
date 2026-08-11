@@ -160,4 +160,26 @@ func TestSameOriginBehindReverseProxy(t *testing.T) {
 	if app.sameOrigin(req) {
 		t.Fatal("cross-origin request was accepted")
 	}
+	req.Header.Set("Origin", "null")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	if !app.sameOrigin(req) {
+		t.Fatal("same-origin browser request with opaque Origin was rejected")
+	}
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	if app.sameOrigin(req) {
+		t.Fatal("cross-site browser request with opaque Origin was accepted")
+	}
+}
+
+func TestSecurityHeadersPreserveSameOriginFormOrigin(t *testing.T) {
+	app := &App{cfg: Config{PublicBaseURL: "https://ledger.lay00.com/transfer"}}
+	handler := app.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "https://ledger.lay00.com/login", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if got := rec.Header().Get("Referrer-Policy"); got != "same-origin" {
+		t.Fatalf("unexpected Referrer-Policy %q", got)
+	}
 }
